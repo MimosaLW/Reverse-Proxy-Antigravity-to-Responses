@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 import asyncpg
 from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .auth import client_api_key, upstream_auth_headers, validate_bridge_auth
 from .anthropic_responses import (
@@ -50,6 +50,7 @@ from .models import (
     gemini_candidate_upstream_models,
     is_official_v1internal_gemini_model,
     resolve_upstream_model,
+    model_list,
 )
 from .sse import parse_sse_events, sse_event
 
@@ -258,7 +259,7 @@ def _timeout(settings: Settings) -> httpx.Timeout:
     )
 
 
-async def _client_group_name(request: Request, settings: Settings) -> str | None:
+async def _client_group_info(request: Request, settings: Settings) -> dict[str, str | None] | None:
     key = client_api_key(request)
     if not key:
         return None
@@ -273,7 +274,8 @@ async def _client_group_name(request: Request, settings: Settings) -> str | None
         try:
             row = await conn.fetchrow(
                 """
-                select g.name as group_name
+                select g.name as group_name,
+                       g.platform as group_platform
                 from api_keys k
                 left join groups g on g.id = k.group_id
                 where k.key = $1
@@ -285,17 +287,69 @@ async def _client_group_name(request: Request, settings: Settings) -> str | None
             )
         finally:
             await conn.close()
-        if row and row.get("group_name"):
-            return str(row["group_name"])
+        if row:
+            return {
+                "group_name": str(row["group_name"]) if row.get("group_name") is not None else None,
+                "group_platform": str(row["group_platform"]) if row.get("group_platform") is not None else None,
+            }
     except Exception:
         return None
     return None
 
 
-def _is_antigravity_group(group_name: str | None, settings: Settings) -> bool:
+async def _client_group_name(request: Request, settings: Settings) -> str | None:
+    info = await _client_group_info(request, settings)
+    if info and info.get("group_name"):
+        return str(info["group_name"])
+    return None
+
+
+def _is_antigravity_group(group_name: str | None, settings: Settings, group_platform: str | None = None) -> bool:
+    platform = (group_platform or "").strip().lower()
+    if platform == "antigravity":
+        return True
     if not group_name:
         return False
-    return group_name.lower() in {name.lower() for name in settings.antigravity_group_names}
+    allowed_names = {name.strip().lower() for name in settings.antigravity_group_names if name.strip()}
+    return group_name.strip().lower() in allowed_names
+
+
+async def _should_bridge_request(request: Request, settings: Settings) -> tuple[bool, dict[str, Any]]:
+    info = await _client_group_info(request, settings) or {}
+    group_name = info.get("group_name")
+    group_platform = info.get("group_platform")
+    bridge_key_used = settings.bridge_api_key is not None and client_api_key(request) == settings.bridge_api_key
+    group_is_antigravity = _is_antigravity_group(group_name, settings, group_platform)
+    reason = "antigravity_group_or_platform" if group_is_antigravity else "non_antigravity_passthrough"
+    if bridge_key_used and not group_is_antigravity:
+        # Fail closed: a configured BRIDGE_API_KEY only enables bridge handling
+        # when the presented key also resolves to an Antigravity group/platform.
+        reason = "bridge_key_not_antigravity_passthrough"
+    return group_is_antigravity, {
+        "group_name": group_name,
+        "group_platform": group_platform,
+        "bridge_key_used": bridge_key_used,
+        "reason": reason,
+    }
+
+
+def _log_value(value: Any) -> str:
+    text = str(value or "-").replace(" ", "_")
+    return text[:120] if text else "-"
+
+
+def _log_route_decision(endpoint: str, model: str | None, route_model: str | None, should_bridge: bool, context: dict[str, Any], *, reason: str | None = None) -> None:
+    decision = "bridge" if should_bridge else "passthrough"
+    print(
+        "nf_bridge.route "
+        f"endpoint={endpoint} decision={decision} "
+        f"group_name={_log_value(context.get('group_name'))} "
+        f"group_platform={_log_value(context.get('group_platform'))} "
+        f"bridge_key_used={bool(context.get('bridge_key_used'))} "
+        f"model={_log_value(model)} route_model={_log_value(route_model)} "
+        f"reason={_log_value(reason or context.get('reason'))}",
+        flush=True,
+    )
 
 
 def _passthrough_headers(request: Request) -> dict[str, str]:
@@ -305,6 +359,32 @@ def _passthrough_headers(request: Request) -> dict[str, str]:
         if value:
             headers[name] = value
     return headers
+
+
+async def _passthrough_openai_models(request: Request, settings: Settings):
+    url = f"{settings.sub2api_base_url}/v1/models"
+    headers = _passthrough_headers(request)
+    async with httpx.AsyncClient(timeout=_timeout(settings)) as client:
+        try:
+            resp = await client.get(url, headers=headers)
+        except Exception as exc:
+            status, body = openai_error(f"Upstream request failed: {exc}", status_code=502, err_type="upstream_error", code="upstream_error")
+            return JSONResponse(status_code=status, content=body)
+    content_type = resp.headers.get("content-type") or "application/json"
+    if "json" in content_type.lower():
+        try:
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            pass
+    return Response(content=resp.content, status_code=resp.status_code, media_type=content_type)
+
+
+async def handle_models(request: Request, settings: Settings):
+    should_bridge, context = await _should_bridge_request(request, settings)
+    _log_route_decision("/v1/models", None, None, should_bridge, context)
+    if should_bridge:
+        return JSONResponse(status_code=200, content=model_list())
+    return await _passthrough_openai_models(request, settings)
 
 
 async def _passthrough_openai_responses(request: Request, settings: Settings, req: dict[str, Any], *, suffix: str = ""):
@@ -738,11 +818,18 @@ async def handle_chat_completions(request: Request, settings: Settings):
         return JSONResponse(status_code=status, content=body)
     route = build_model_route(model)
 
-    group_name = await _client_group_name(request, settings)
-    bridge_key_used = settings.bridge_api_key is not None and client_api_key(request) == settings.bridge_api_key
-    should_bridge = bridge_key_used or _is_antigravity_group(group_name, settings)
-    if should_bridge and route.route_model in GEMINI_RESPONSES_MODELS:
-        if bridge_key_used:
+    should_bridge, context = await _should_bridge_request(request, settings)
+    final_bridge = should_bridge and route.route_model in GEMINI_RESPONSES_MODELS
+    _log_route_decision(
+        "/v1/chat/completions",
+        model,
+        route.route_model,
+        final_bridge,
+        context,
+        reason=None if final_bridge else ("chat_model_not_bridge_supported" if should_bridge else None),
+    )
+    if final_bridge:
+        if context.get("bridge_key_used"):
             auth_error = validate_bridge_auth(request, settings)
             if auth_error is not None:
                 return auth_error
@@ -801,9 +888,8 @@ async def handle_responses(request: Request, settings: Settings):
         return JSONResponse(status_code=status, content=body)
     route = build_model_route(model)
 
-    group_name = await _client_group_name(request, settings)
-    bridge_key_used = settings.bridge_api_key is not None and client_api_key(request) == settings.bridge_api_key
-    should_bridge = bridge_key_used or _is_antigravity_group(group_name, settings)
+    should_bridge, context = await _should_bridge_request(request, settings)
+    _log_route_decision("/v1/responses", model, route.route_model, should_bridge, context)
     if not should_bridge:
         # Non-Antigravity groups, e.g. OpenAI, should be handled by Sub2API's
         # native gateway and its own API-key/auth/account routing.
@@ -816,7 +902,7 @@ async def handle_responses(request: Request, settings: Settings):
         )
         return JSONResponse(status_code=status, content=body)
 
-    if bridge_key_used:
+    if context.get("bridge_key_used"):
         auth_error = validate_bridge_auth(request, settings)
         if auth_error is not None:
             return auth_error

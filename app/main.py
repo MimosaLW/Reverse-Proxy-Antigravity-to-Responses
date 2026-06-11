@@ -4,8 +4,7 @@ from fastapi.responses import JSONResponse
 from .admin_proxy import admin_account_models, admin_account_test, admin_default_model_mapping
 from .anthropic_proxy import handle_messages
 from .config import get_settings
-from .models import model_list
-from .responses_bridge import handle_chat_completions, handle_responses
+from .responses_bridge import handle_chat_completions, handle_models, handle_responses
 
 app = FastAPI(title="NF Sub2API Antigravity Bridge", version="0.1.0")
 settings = get_settings()
@@ -17,8 +16,8 @@ async def health():
 
 
 @app.get("/v1/models")
-async def models():
-    return model_list()
+async def models(request: Request):
+    return await handle_models(request, settings)
 
 
 @app.post("/v1/responses")
